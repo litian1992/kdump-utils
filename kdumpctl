@@ -7,11 +7,23 @@ KEXEC_ARGS=""
 MKDUMPRD="/sbin/mkdumprd -f"
 MKFADUMPRD="/sbin/mkfadumprd"
 DRACUT_MODULES_FILE="/usr/lib/dracut/modules.txt"
+
+# Path to the initrd used for normal boot. Used to determine the naming
+# convention and in case for fadump (and earlykdump) gets rebuild.
 DEFAULT_INITRD=""
+
+# Path to backup and checksum of the default initrd. Used to backup/restore the
+# default initrd for fadump.
 DEFAULT_INITRD_BAK=""
-INITRD_CHECKSUM_LOCATION=""
+DEFAULT_INITRD_CHECKSUM=""
+
+# Path to the initrd used for kdump
 KDUMP_INITRD=""
+
+# Path to the initrd depending on the dump mode. Identical to KDUMP_INITRD for
+# kdump and DEFAULT_INITRD for fadump
 TARGET_INITRD=""
+
 #kdump shall be the default dump mode
 DEFAULT_DUMP_MODE="kdump"
 VMCORE_CREATION_STATUS="/var/lib/kdump/vmcore-creation.status"
@@ -243,19 +255,22 @@ backup_default_initrd()
 	ddebug "backup default initrd: $DEFAULT_INITRD"
 
 	if [[ ! -f $DEFAULT_INITRD ]]; then
+		ddebug "\$DEFAULT_INITRD=$DEFAULT_INITRD does not exist"
 		return
 	fi
 
-	if [[ ! -e $DEFAULT_INITRD_BAK ]]; then
-		dinfo "Backing up $DEFAULT_INITRD before rebuild."
-		# save checksum to verify before restoring
-		sha1sum "$DEFAULT_INITRD" > "$INITRD_CHECKSUM_LOCATION"
-		if ! cp "$DEFAULT_INITRD" "$DEFAULT_INITRD_BAK"; then
-			dwarn "WARNING: failed to backup $DEFAULT_INITRD."
-			rm -f -- "$INITRD_CHECKSUM_LOCATION"
-			rm -f -- "$DEFAULT_INITRD_BAK"
-		fi
+	if [[ -f $DEFAULT_INITRD_BAK ]]; then
+		ddebug "\$DEFAULT_INITRD_BAK=$DEFAULT_INITRD_BAK already exist"
+		return
 	fi
+
+	dinfo "Backing up $DEFAULT_INITRD before rebuild."
+	if ! cp "$DEFAULT_INITRD" "$DEFAULT_INITRD_BAK"; then
+		dwarn "WARNING: failed to backup $DEFAULT_INITRD."
+		rm -f -- "$DEFAULT_INITRD_BAK"
+		return
+	fi
+	sha512sum "$DEFAULT_INITRD_BAK" > "$DEFAULT_INITRD_CHECKSUM"
 }
 
 restore_default_initrd()
@@ -263,24 +278,31 @@ restore_default_initrd()
 	ddebug "restore default initrd: $DEFAULT_INITRD"
 
 	if [[ ! -f $DEFAULT_INITRD ]]; then
+		ddebug "\$DEFAULT_INITRD=$DEFAULT_INITRD does not exist"
+		return
+	fi
+
+	if [[ ! -f $DEFAULT_INITRD_BAK ]]; then
+		ddebug "\$DEFAULT_INITRD_BAK=$DEFAULT_INITRD_BAK does not exist"
+		return
+	fi
+
+	if [[ ! -f $DEFAULT_INITRD_CHECKSUM ]]; then
+		ddebug "\$DEFAULT_INITRD_CHECKSUM=$DEFAULT_INITRD_CHECKSUM does not exist"
 		return
 	fi
 
 	# If a backup initrd exists, we must be switching back from
 	# fadump to kdump. Restore the original default initrd.
-	if [[ -f $DEFAULT_INITRD_BAK ]] && [[ -f $INITRD_CHECKSUM_LOCATION ]]; then
-		# verify checksum before restoring
-		backup_checksum=$(sha1sum "$DEFAULT_INITRD_BAK" | awk '{ print $1 }')
-		default_checksum=$(awk '{ print $1 }' "$INITRD_CHECKSUM_LOCATION")
-		if [[ $default_checksum != "$backup_checksum" ]]; then
-			dwarn "WARNING: checksum mismatch! Can't restore original initrd.."
-		else
-			rm -f "$INITRD_CHECKSUM_LOCATION"
-			if mv "$DEFAULT_INITRD_BAK" "$DEFAULT_INITRD"; then
-				derror "Restoring original initrd as fadump mode is disabled."
-				sync -f "$DEFAULT_INITRD"
-			fi
-		fi
+	if ! sha512sum --status --check "$DEFAULT_INITRD_CHECKSUM"; then
+		dwarn "WARNING: checksum mismatch! Can't restore original initrd."
+		return
+	fi
+
+	rm -f "$DEFAULT_INITRD_CHECKSUM"
+	if mv "$DEFAULT_INITRD_BAK" "$DEFAULT_INITRD"; then
+		derror "Restoring original initrd as fadump mode is disabled."
+		sync -f "$DEFAULT_INITRD"
 	fi
 }
 
@@ -411,7 +433,7 @@ setup_initrd()
 	fi
 
 	DEFAULT_INITRD_BAK="$KDUMP_BOOTDIR/.$(basename "$DEFAULT_INITRD").default"
-	INITRD_CHECKSUM_LOCATION="$DEFAULT_INITRD_BAK.checksum"
+	DEFAULT_INITRD_CHECKSUM="$DEFAULT_INITRD_BAK.checksum"
 	if [[ $DEFAULT_DUMP_MODE == "fadump" ]]; then
 		TARGET_INITRD="$DEFAULT_INITRD"
 
@@ -1056,6 +1078,35 @@ check_final_action_config()
 	esac
 }
 
+remove_luks_vol_keys()
+{
+	local _key_line _key_id _key_desc _status=1
+
+	# Get all keys from @u keyring and process each line
+	while read -r _key_line; do
+		# Skip header lines and empty lines
+		[[ $_key_line =~ ^[0-9]+: ]] || continue
+
+		# Extract key ID (first field before colon)
+		_key_id=${_key_line%%:*}
+
+		# Extract key description (everything after "logon: " or "user: ")
+		if [[ $_key_line =~ logon:\ (.+)$ ]]; then
+			_key_desc=${BASH_REMATCH[1]}
+		else
+			continue
+		fi
+
+		# Check if key description starts with LUKS_KEY_PRFIX
+		if [[ $_key_desc == "$LUKS_KEY_PRFIX"* ]]; then
+			keyctl unlink "$_key_id"
+			_status=0
+		fi
+	done < <(keyctl list @u 2> /dev/null || true)
+
+	return $_status
+}
+
 _get_luks_key_by_unlock()
 {
 	local _devuuid=$1 _key_des=$2
@@ -1079,7 +1130,8 @@ _get_luks_key_by_unlock()
 	while [ "$_attempt" -le "$_max_retries" ]; do
 		if cryptsetup open "UUID=$_devuuid" DUMMY "--link-vk-to-keyring=@u::%logon:$_key_des" --test-passphrase; then
 			ddebug "Success: LUKS device unlocked."
-			dwarn "To avoid manually running kdumpctl, ensure the link-volume-key=@u::%logon:$_key_des option is correctly set up in /etc/crypttab (see man crypttab)."
+			# For an interactive terminal, it's possible an user manually entered a passphrase
+			[ -t 0 ] && dwarn "If you typed passphrase to unlock it manually, please run 'kdumpctl setup-crypttab' (see man kdumpctl)."
 			return 0
 		fi
 		_attempt=$((_attempt + 1))
@@ -1091,25 +1143,34 @@ _get_luks_key_by_unlock()
 
 prepare_luks()
 {
-	local _luks_dev _key_id _key_des _luks_unlock_cmd
+	local _key_id _key_des _luks_unlock_cmd
 	declare -a _luks_devs
 
 	mapfile -t _luks_devs < <(get_all_kdump_crypt_dev)
 
 	if [[ ${#_luks_devs[@]} -lt 1 ]]; then
-		return
+		if remove_luks_vol_keys; then
+			dwarn "Encrypted device not in dump path, please drop the link-volume-key option in $CRYPTTAB_FILE"
+		fi
+		return 0
+	fi
+
+	# Currently only x86_64 is supported
+	if [[ "$(uname -m)" != "x86_64" ]]; then
+		dwarn "Warning: Encrypted device is in dump path, which is not recommended, see kexec-kdump-howto.txt for more details."
+		return 0
 	fi
 
 	if [[ ! -d $LUKS_CONFIGFS ]]; then
-		dwarn "$LUKS_CONFIGFS not available, please use a newer kernel."
-		return 1
+		dwarn "$LUKS_CONFIGFS not available, please use a newer kernel or see kexec-kdump-howto.txt to make sure dumping to encrypted target will work."
+		remove_luks_vol_keys
+		return 0
 	fi
 
 	# For the case of CPU/memory hotplugging, we can reuse loaded keys
 	[[ $(cat $LUKS_CONFIGFS/reuse) == 1 ]] && return 0
 
-	for _luks_dev in "${_luks_devs[@]}"; do
-		_devuuid=$(maj_min_to_uuid "$_luks_dev")
+	for _devuuid in "${_luks_devs[@]}"; do
 		_key_dir=$LUKS_CONFIGFS/$_devuuid
 		_key_des=$LUKS_KEY_PRFIX$_devuuid
 		if _key_id=$(keyctl request logon "$_key_des" 2> /dev/null); then
@@ -1163,6 +1224,111 @@ start()
 
 	dinfo "Starting kdump: [OK]"
 	return 0
+}
+
+# @description Updates a crypttab file to add the 'link-volume-key' option for kdump devices.
+#
+# It gets the list of kdump-related UUIDs by calling the 'get_all_kdump_crypt_dev' function.
+# The function is idempotent and performs pre-flight checks before making any modifications.
+#
+# @exitcode 0 If the update was successful or no changes were needed.
+# @exitcode 1 If there is an error (e.g. UUID mismatch).
+#
+# @stdout No output on success.
+# @stderr Progress and error messages are printed to stderr.
+CRYPTTAB_FILE=/etc/crypttab
+setup_crypttab()
+{
+	local _devuuid uuids_string temp_file
+	declare -a _luks_devs
+
+	if [[ "$(uname -m)" != "x86_64" ]]; then
+		dwarn "Currently only x86_64 supported"
+		return 0
+	fi
+
+	if [[ ! -f $CRYPTTAB_FILE ]]; then
+		dinfo "$CRYPTTAB_FILE doesn't exist, skip setup"
+		return 0
+	fi
+
+	mapfile -t _luks_devs < <(get_all_kdump_crypt_dev)
+	if [[ ${#_luks_devs[@]} -eq 0 ]]; then
+		dinfo "No LUKS-encrypted device found to process. Exiting."
+		return 0
+	fi
+
+	for _devuuid in "${_luks_devs[@]}"; do
+		if ! awk -v devuuid="$_devuuid" '!/^[[:space:]]*#/ && $2 == "UUID="devuuid { found=1; exit } END { exit !found }' "$CRYPTTAB_FILE"; then
+			derror "Device UUID=${_devuuid} doesn't exist."
+			return 1
+		fi
+	done
+
+	uuids_string="${_luks_devs[*]}"
+	temp_file=$(mktemp)
+
+	local status_updates
+
+	status_updates=$({
+		awk -v prefix="$LUKS_KEY_PRFIX" -v targets="$uuids_string" '
+    BEGIN {
+        split(targets, temp_arr, " ")
+        for (i in temp_arr) { target_uuids[temp_arr[i]] = 1 }
+    }
+    /^#|^$/ { print; next }
+    {
+        split($2, uuid_parts, "=")
+        current_uuid = uuid_parts[2]
+
+        if (current_uuid in target_uuids) {
+            target_option = "link-volume-key=@u::%logon:" prefix current_uuid
+
+            if (!index($0, target_option)) {
+                # If we need to modify, check if we are replacing or adding
+                if (index($0, "link-volume-key=")) {
+                    print "STATUS:REPLACED:" current_uuid > "/dev/stderr"
+                } else {
+                    print "STATUS:ADDED:" current_uuid > "/dev/stderr"
+                }
+
+                # Remove any existing, incorrect link-volume-key option
+                sub(/,?link-volume-key=[^, ]+/, "", $4)
+                sub(/^,/, "", $4)
+
+                # Add the correct option
+                if (NF < 3 || $3 == "") { $3 = "none" }
+                if ($4 == "" || $4 == "none") {
+                    $4 = target_option
+                } else {
+                    $4 = $4 "," target_option
+                }
+            }
+        }
+        print
+    }' "$CRYPTTAB_FILE" > "$temp_file"
+	} 2>&1)
+
+	if cmp -s "$CRYPTTAB_FILE" "$temp_file"; then
+		dinfo "No changes were needed. $CRYPTTAB_FILE is already up to date."
+		rm "$temp_file"
+		return 0
+	else
+		mv "$temp_file" "$CRYPTTAB_FILE"
+		dinfo "Success! $CRYPTTAB_FILE has been updated."
+
+		# Parse status updates and report on each changed UUID
+		while IFS=: read -r _ status uuid; do
+			if [[ $status == "ADDED" ]]; then
+				dinfo "   - Added link-volume-key for UUID: $uuid"
+			elif [[ $status == "REPLACED" ]]; then
+				dinfo "   - Replaced link-volume-key for UUID: $uuid"
+			fi
+		done < <(echo "$status_updates" | grep "STATUS:")
+		dinfo "If the dump target is rootfs and you call this command manually, you will need to run 'dracut -f --regenerate-all' to regenerate initramfs."
+
+		return 0
+	fi
 }
 
 reload()
@@ -2091,8 +2257,11 @@ main()
 			reset_crashkernel_for_installed_kernel "$2"
 		fi
 		;;
+	setup-crypttab)
+		setup_crypttab
+		;;
 	*)
-		dinfo $"Usage: $0 {estimate|start|stop|status|restart|reload|rebuild|reset-crashkernel|propagate|showmem|test}"
+		dinfo $"Usage: $0 {estimate|start|stop|status|restart|reload|rebuild|reset-crashkernel|propagate|showmem|test|setup-crypttab}"
 		exit 1
 		;;
 	esac

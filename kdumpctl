@@ -324,6 +324,7 @@ _set_config()
 		fi
 		return 1
 	fi
+	[[ $_val == \"*\" ]] && _val=${_val:1:-1}
 	OPT[$opt]="$val"
 }
 
@@ -736,7 +737,8 @@ function load_kdump_kernel_key()
 	if ! [[ -f /proc/device-tree/ibm,secure-boot ]]; then
 		return
 	fi
-
+	# %.ima keyring is writable to the user, no need to use
+	# "sudo -i keyctl"
 	keyctl padd asymmetric "" %:.ima < "/usr/share/doc/kernel-keys/$KDUMP_KERNELVER/kernel-signing-ppc.cer"
 }
 
@@ -759,6 +761,7 @@ load_kdump()
 		return 1
 	fi
 
+	[[ ${KEYCTL_CMD[0]} == sudo ]] && KEXEC="sudo -i $KEXEC"
 	ddebug "$KEXEC ${args[*]}"
 	if $KEXEC "${args[@]}"; then
 		dinfo "kexec: loaded kdump kernel"
@@ -1083,6 +1086,9 @@ remove_luks_vol_keys()
 	local _key_line _key_id _key_desc _status=1
 
 	# Get all keys from @u keyring and process each line
+	# sudo process by default only has the permission to list the keys
+	# stored in user keyring i.e. "sudo keyctl list" can work not
+	# "sudo keyctl unlink/show"
 	while read -r _key_line; do
 		# Skip header lines and empty lines
 		[[ $_key_line =~ ^[0-9]+: ]] || continue
@@ -1099,7 +1105,7 @@ remove_luks_vol_keys()
 
 		# Check if key description starts with LUKS_KEY_PRFIX
 		if [[ $_key_desc == "$LUKS_KEY_PRFIX"* ]]; then
-			keyctl unlink "$_key_id"
+			"${KEYCTL_CMD[@]}" unlink "$_key_id"
 			_status=0
 		fi
 	done < <(keyctl list @u 2> /dev/null || true)
@@ -1141,10 +1147,21 @@ _get_luks_key_by_unlock()
 	return 1
 }
 
+# Some users may use "sudo kdumpctl". sudo process by default inherits the
+# session keyring (@s) of the original user which means it can't read LUKS keys
+# stored in root's user (@u) which is only linked to root's session keyring.
+# So use "sudo -i keyctl" and "sudo kexec" automatically in order to be able to
+# search and read the LUKS key(s).
+KEYCTL_CMD=(keyctl)
 prepare_luks()
 {
 	local _key_id _key_des _luks_unlock_cmd
 	declare -a _luks_devs
+
+	# Use "sudo -i" to use the root's session keyring to access LUKS keys
+	if ! keyctl show @s | grep -qs "_uid.0$"; then
+		KEYCTL_CMD=(sudo -i keyctl)
+	fi
 
 	mapfile -t _luks_devs < <(get_all_kdump_crypt_dev)
 
@@ -1173,10 +1190,13 @@ prepare_luks()
 	for _devuuid in "${_luks_devs[@]}"; do
 		_key_dir=$LUKS_CONFIGFS/$_devuuid
 		_key_des=$LUKS_KEY_PRFIX$_devuuid
-		if _key_id=$(keyctl request logon "$_key_des" 2> /dev/null); then
+		if _key_id=$("${KEYCTL_CMD[@]}" request logon "$_key_des" 2> /dev/null); then
 			ddebug "Succesfully get @u::%logon:$_key_des"
 		elif _get_luks_key_by_unlock "$_devuuid" "$_key_des"; then
-			_key_id=$(keyctl request logon "$_key_des")
+			if ! _key_id=$("${KEYCTL_CMD[@]}" request logon "$_key_des"); then
+				derror "Probably you are using 'sudo kdumpctl' or 'sudo su', please retry with 'sudo -i kdumpctl'"
+				return 1
+			fi
 			ddebug "Succesfully get @u::%logon:$_key_des after cryptsetup"
 		else
 			derror "Failed to get logon key $_key_des. Run 'kdumpctl restart' manually to start kdump."
@@ -1184,7 +1204,7 @@ prepare_luks()
 		fi
 
 		# Let the key expire after 300 seconds
-		keyctl timeout "$_key_id" 300
+		"${KEYCTL_CMD[@]}" timeout "$_key_id" 300
 		mkdir "$_key_dir"
 		printf "%s" "$_key_des" > "$_key_dir"/description
 	done
@@ -1315,6 +1335,7 @@ setup_crypttab()
 		return 0
 	else
 		mv "$temp_file" "$CRYPTTAB_FILE"
+		restorecon "$CRYPTTAB_FILE"
 		dinfo "Success! $CRYPTTAB_FILE has been updated."
 
 		# Parse status updates and report on each changed UUID
@@ -2044,7 +2065,7 @@ set_vmcore_creation_status()
 fetch_status()
 {
 	local _test_id="$1" _mnt
-	local _status
+	local _status _timeout_cmd=""
 
 	is_raw_dump_target && return 2
 
@@ -2052,9 +2073,13 @@ fetch_status()
 
 	if is_nfs_dump_target || is_local_target; then
 		_mnt=$(get_mntpoint_from_target "${OPT[_target]}")
+		if is_nfs_dump_target; then
+			_timeout_cmd="timeout --preserve-status 5m"
+		fi
+
 		if [[ -z $_mnt ]] || ! is_mounted "$_mnt"; then
 			mkdir -p "$TMPMNT"
-			mount "${OPT[_target]}" "$TMPMNT" -t "${OPT[_fstype]}" -o defaults ||
+			$_timeout_cmd mount "${OPT[_target]}" "$TMPMNT" -t "${OPT[_fstype]}" -o defaults ||
 				{
 					dwarn "Failed to mount ${OPT[_target]}" && return 2
 				}
@@ -2133,16 +2158,16 @@ check_vmcore_creation_status()
 
 	case "$_status" in
 	success)
-		dinfo "Notice: Last successful vmcore creation on $_status_date"
+		dinfo "Notice: Last successful vmcore creation test on $_status_date"
 		;;
 	fail)
-		dwarn "Notice: Last NOT successful vmcore creation on $_status_date"
+		dwarn "Notice: Last NOT successful vmcore creation test on $_status_date"
 		;;
 	manual)
-		dwarn "Notice: Require manual check for kdump test of $_status_date"
+		dwarn "Notice: Require manual check for vmcore creation test of $_status_date"
 		;;
 	*)
-		derror "Unknown test status: $_status"
+		derror "Unknown vmcore creation test status: $_status"
 		;;
 	esac
 }
@@ -2187,6 +2212,8 @@ main()
 			derror "Starting kdump: [FAILED]"
 			exit 1
 		fi
+		check_vmcore_creation_status
+		exit 0
 		;;
 	stop)
 		if ! stop; then
@@ -2223,6 +2250,7 @@ main()
 			exit 1
 		fi
 		check_vmcore_creation_status
+		exit 0
 		;;
 	rebuild)
 		rebuild

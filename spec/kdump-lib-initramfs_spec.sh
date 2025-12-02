@@ -12,6 +12,7 @@ Describe 'kdump-lib-initramfs'
 			#|dracut_args --omit-drivers "cfg80211 snd" --add-drivers "ext2 ext3"
 			#|sshkey /root/.ssh/kdump_id_rsa
 			#|ssh user@my.server.com
+			#|core_collector "makedumpfile -l --message-level 7 -d 31"
 		}
 		kdump_config >$KDUMP_CONFIG_FILE
 		Context 'Given different cases'
@@ -21,6 +22,7 @@ Describe 'kdump-lib-initramfs'
 			#  - complicate value for dracut_args
 			#  - Given two parameters, retrive one parameter that has value specified
 			#  - Given two parameters (in reverse order), retrive one parameter that has value specified
+			#  - values are enclosed in quotes
 			Parameters
 				"#1" nfs my.server.com:/export/tmp
 				"#2" ssh user@my.server.com
@@ -28,6 +30,7 @@ Describe 'kdump-lib-initramfs'
 				"#4" dracut_args '--omit-drivers "cfg80211 snd" --add-drivers "ext2 ext3"'
 				"#5" 'ssh\|aaa' user@my.server.com
 				"#6" 'aaa\|ssh' user@my.server.com
+				"#7" core_collector "makedumpfile -l --message-level 7 -d 31"
 			End
 
 			It 'should handle all cases correctly'
@@ -64,6 +67,12 @@ Describe 'kdump-lib-initramfs'
 				else
 					printf '/var %s[/ostree/deploy/default/var]\n/sysroot %s\n' "$7" "$7"
 				fi
+			elif [[ "$7" == '/dev/nvme0n1p3' ]]; then
+				if [[ "$8" == "-f" ]]; then
+					printf '/ /dev/nvme0n1p3[/root]\n'
+				else
+					printf '/ /dev/nvme0n1p3[/root]\n/var /dev/nvme0n1p3[/var]\n'
+				fi
 			fi
 		}
 
@@ -73,19 +82,51 @@ Describe 'kdump-lib-initramfs'
 			#  - IPv6 NFS target also contain '[' in the export
 			#  - local dumping target that has '[' in the name
 			#  - has bind mint
+			#  - has subvol
 			Parameters
-				'eng.redhat.com:/srv/[nfs]' '/mnt'
-				'[2620:52:0:a1:217:38ff:fe01:131]:/srv/[nfs]' '/mnt'
-				'/dev/mapper/rhel[disk]' '/'
-				'/dev/vda4' '/sysroot'
+				'eng.redhat.com:/srv/[nfs]' '' '/mnt'
+				'[2620:52:0:a1:217:38ff:fe01:131]:/srv/[nfs]' '' '/mnt'
+				'/dev/mapper/rhel[disk]' '' '/'
+				'/dev/vda4' '' '/sysroot'
+				'/dev/nvme0n1p3' '/var' '/var'
 			End
 
 			It 'should handle all cases correctly'
-				When call get_mntpoint_from_target "$1"
-				The output should equal "$2"
+				When call get_mntpoint_from_target "$1" "$2"
+				The output should equal "$3"
 			End
 		End
 
 	End
 
+	Describe 'Test get_btrfs_subvol_from_mntopt'
+		Context 'Given different mount option formats'
+			# Test the following cases:
+			#  - Standard subvol option at the beginning
+			#  - Standard subvol option in the middle
+			#  - Standard subvol option at the end
+			#  - Subvol with @ prefix (common btrfs pattern)
+			#  - Subvol with complex path
+			#  - No subvol option present
+			#  - Empty mount options
+			#  - Subvol option with no value
+			#  - Similar but different option names
+			Parameters
+				"subvol=/home,rw,relatime" "/home"
+				"rw,subvol=/root,defaults" "/root"
+				"rw,relatime,subvol=/root" "/root"
+				"subvol=@home" "@home"
+				"subvol=/path/to/subvolume,rw" "/path/to/subvolume"
+				"rw,relatime,defaults" ""
+				true ''
+				"subvol=,rw" ""
+				"rw,subvolume=@home" ""
+			End
+
+			It 'should extract subvolume correctly'
+				When call get_btrfs_subvol_from_mntopt "$1"
+				The output should equal "$2"
+			End
+		End
+	End
 End

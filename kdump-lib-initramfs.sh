@@ -29,9 +29,10 @@ kdump_read_conf()
 kdump_get_conf_val()
 {
 	# For lines matching "^\s*$1\s+", remove matched part (config name including space),
-	# remove tailing comment, space, then store in hold space. Print out the hold buffer on last line.
+	# remove tailing comment, space and the surrounding quotes, then store in hold space.
+	# Print out the hold buffer on last line.
 	[ -f "$KDUMP_CONFIG_FILE" ] &&
-		sed -n -e "/^\s*\($1\)\s\+/{s/^\s*\($1\)\s\+//;s/#.*//;s/\s*$//;h};\${x;p}" $KDUMP_CONFIG_FILE
+		sed -n -e "/^\s*\($1\)\s\+/{s/^\s*\($1\)\s\+//;s/#.*//;s/\s*$//;s/^\"\(.*\)\"$/\1/;h};\${x;p}" $KDUMP_CONFIG_FILE
 }
 
 is_mounted()
@@ -109,13 +110,27 @@ get_fs_type_from_target()
 
 get_mntpoint_from_target()
 {
-	# get the first TARGET when SOURCE doesn't end with ].
-	# In most cases, a SOURCE ends with ] when fsroot or subvol exists.
-	_mntpoint=$(get_mount_info TARGET,SOURCE source "$1" | grep -v "\]$" | awk 'NR==1 { print $1 }')
-
+	_subvol="$2"
+	if [ -z "$_subvol" ]; then
+		# get the first TARGET when SOURCE doesn't end with ].
+		# In most cases, a SOURCE ends with ] when fsroot or subvol exists.
+		_mntpoint=$(get_mount_info TARGET,SOURCE source "$1" | grep -v "\]$" | awk 'NR==1 { print $1 }')
+	else
+		# btrfs with subvol
+		_mntpoint=$(get_mount_info TARGET,SOURCE source "$1" | grep "\[$_subvol\]$" | awk 'NR==1 { print $1 }')
+	fi
 	# fallback to the old way when _mntpoint is empty.
 	[ -n "$_mntpoint" ] || _mntpoint=$(get_mount_info TARGET source "$1" -f)
 	echo "$_mntpoint"
+}
+
+get_btrfs_subvol_from_mntopt()
+{
+	_subvol=${1#*subvol=}
+	# mount option may not contain subvol
+	[ "$1" != "$_subvol" ] || return 0
+	_subvol=${_subvol%%,*}
+	echo "$_subvol"
 }
 
 is_ssh_dump_target()
